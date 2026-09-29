@@ -184,6 +184,29 @@ Use `--no-progressive-ply` on `run_demo.sh` to skip this post-processing step.
 For dataset-scale generation metrics (FVD / FID / 3D-consistency / MEt3R) see
 [Training & evaluation](#-training--evaluation) below.
 
+### ⚡ Multi-GPU Ulysses I2V server
+
+For an 81-view I2V service using Ulysses sequence parallelism, run the launcher
+on a machine with at least eight CUDA GPUs:
+
+```bash
+NGPU=8 GRADIO_SHARE=1 bash scripts/demo/run_serve_ulysses_i2v.sh
+```
+
+The launcher creates or reuses its environment and Hugging Face cache on local
+SSD, downloads `TencentARC/GAE-D64-1B` on first use, and starts the Gradio
+server. Set `PORT`, `GRADIO_AUTH`, `GAE_VENV`, `GAE_CKPT_DIR`, or
+`GAE_SERVE_OUTPUT` to customize deployment. For a batch CLI run without Gradio:
+
+```bash
+NGPU=8 SCENE=forest_lake_trail bash scripts/demo/run_ulysses_i2v.sh
+```
+
+`CFG_PARALLEL=1` enables even-GPU classifier-free-guidance parallelism;
+`SAMPLE_STEPS`, `TOTAL_VIEWS`, `SCENES`, and `TRAJECTORIES` control the batch
+run. The launcher keeps checkpoints and generated results outside the checkout
+so the code can be refreshed without deleting model state.
+
 ### 🖼️ Image from a prompt (single frame)
 
 ```bash
