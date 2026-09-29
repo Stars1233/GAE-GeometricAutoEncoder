@@ -49,7 +49,7 @@ PC_STRIDE = max(1, int(os.environ.get("PC_STRIDE", "6")))
 RESOLUTION = (378, 672)
 DEFAULT_FPS = 12
 EXAMPLE_IMAGE = ROOT / "examples" / "scenes" / "forest_lake_trail.jpg"
-WEB_FPS = int(os.environ.get("WEB_FPS", "24"))
+WEB_FPS = int(os.environ.get("WEB_FPS", "0"))
 DEFAULT_POSES = ROOT / "examples" / "scenes" / "forest_lake_trail_poses.npz"
 CAPTION_MODEL = os.environ.get(
     "CAPTION_MODEL",
@@ -331,16 +331,16 @@ def _pointcloud_preview(ply: Path, max_points: int = 400_000) -> Path | None:
 
 
 def _web_video(src: Path | None) -> Path | None:
-    """Browser copy of a sampler video: motion-interpolated to WEB_FPS and
-    capped at 2 Mbit/s so it plays smoothly through the share tunnel."""
-    if src is None:
-        return None
+    """Browser copy of a sampler video. The sampler already writes browser-ready
+    H.264 (crf 18, yuv420p, faststart), so it is served as is unless WEB_FPS > 0
+    asks for motion interpolation, which softens frames and warps edges."""
+    if src is None or WEB_FPS <= 0:
+        return src
     out = src.with_name(src.stem + "_web.mp4")
-    vf = f"minterpolate=fps={WEB_FPS}:mi_mode=mci" if WEB_FPS > 0 else "null"
     command = [
-        "ffmpeg", "-v", "error", "-y", "-i", str(src), "-vf", vf,
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-        "-maxrate", "2M", "-bufsize", "4M", "-pix_fmt", "yuv420p",
+        "ffmpeg", "-v", "error", "-y", "-i", str(src),
+        "-vf", f"minterpolate=fps={WEB_FPS}:mi_mode=mci",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
         "-movflags", "+faststart", str(out),
     ]
     try:
