@@ -197,19 +197,40 @@ and [one-time provisioning script](scripts/demo/provision_fast_demo.sh), with
 eight CUDA GPUs by default. Its models stay loaded between requests. The existing
 `app.py` Space and preset-trajectory demo remain available.
 
-### ⚡ Multi-GPU Ulysses I2V server
-
-For an 81-view I2V service using Ulysses sequence parallelism, run the launcher
-on a machine with at least eight CUDA GPUs:
-
 ```bash
-NGPU=8 GRADIO_SHARE=1 bash scripts/demo/run_serve_ulysses_i2v.sh
+bash scripts/demo/provision_fast_demo.sh        # once (needs uv): .venv, checkpoints, Hub models
+HOST=0.0.0.0 PORT=7860 bash scripts/demo/run_fast_demo.sh
 ```
 
-The launcher creates or reuses its environment and Hugging Face cache on local
-SSD, downloads `TencentARC/GAE-D64-1B` on first use, and starts the Gradio
-server. Set `PORT`, `GRADIO_AUTH`, `GAE_VENV`, `GAE_CKPT_DIR`, or
-`GAE_SERVE_OUTPUT` to customize deployment. For a batch CLI run without Gradio:
+The page has three tabs, all served by the same resident models:
+
+- **Camera Studio**: uploading an image writes a scene description into the
+  prompt box with Qwen2.5-VL-7B-Instruct (about 16 GB, loaded in the
+  background at start-up on the GPU with the most free memory). Bundled
+  examples use their `.txt` descriptions. The decoded depth video is under
+  *Downloads & details*.
+- **Video reconstruction**: encodes up to 81 frames with the resident codec and
+  shows RGB, depth, and the point cloud in a 3D viewer (PLY download included).
+- **Text to image**: runs on the resident multi-GPU sampler with a choice of
+  internal guidance (IG, the `generate_t2i.py` default) or CFG and a guidance
+  scale; depth and a 3D point-cloud view are shown with the image.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `HOST`, `PORT` | `127.0.0.1`, `7860` | Gradio address |
+| `GRADIO_SHARE` | `0` | `1` prints a temporary public `gradio.live` link |
+| `NGPU` | `8` | GPUs for the resident sampler (even, for CFG parallelism) |
+| `GAE_VENV`, `GAE_CKPT_DIR` | `.venv`, `ckpts` | Environment and checkpoints from provisioning |
+| `GAE_CAPTION` | `1` | `0` disables scene descriptions (and their download) |
+| `CAPTION_MODEL` | `Qwen/Qwen2.5-VL-7B-Instruct` | Hub ID or local directory of the caption model |
+
+The service runs with the Hugging Face Hub offline, so any model it loads must
+already be in the local cache (provisioning downloads them) or be a local path.
+
+### ⚡ Multi-GPU Ulysses I2V (batch)
+
+For batch 81-view I2V with Ulysses sequence parallelism, without a web page, run
+the launcher on a machine with at least eight CUDA GPUs:
 
 ```bash
 NGPU=8 SCENE=forest_lake_trail bash scripts/demo/run_ulysses_i2v.sh
@@ -219,6 +240,10 @@ NGPU=8 SCENE=forest_lake_trail bash scripts/demo/run_ulysses_i2v.sh
 `SAMPLE_STEPS`, `TOTAL_VIEWS`, `SCENES`, and `TRAJECTORIES` control the batch
 run. The launcher keeps checkpoints and generated results outside the checkout
 so the code can be refreshed without deleting model state.
+
+For a multi-GPU web page, use [Camera Studio](#-camera-studio);
+`scripts/demo/run_serve_ulysses_i2v.sh` remains as a lighter page with preset
+trajectories only.
 
 ### 🖼️ Image from a prompt (single frame)
 
@@ -258,15 +283,19 @@ python scripts/demo/reconstruct_vae.py \
   --output results/vae_recon
 ```
 
-Outputs are written as `results/vae_recon/<scene>/{rgb_recon.mp4,depth_recon.mp4,recon_pointcloud.ply}`.
-The PLY is built directly from the decoded depth and ray prediction, with a
-default 4-pixel stride (`--pc-stride` controls the density).
+Outputs are written as `results/vae_recon/<scene>/{rgb_recon.mp4,depth_recon.mp4,recon_pointcloud.ply}`,
+plus `recon_pointcloud_preview.glb` for browser viewers. The binary PLY is built
+directly from the decoded depth and ray prediction, with a default 4-pixel
+stride (`--pc-stride` controls the density). Videos are truncated to the first
+81 frames, the clip length the codec was trained on (`--max-frames` changes it).
 
 ---
 
-## 🤗 Hugging Face Space
+## 🤗 Single-GPU Gradio app (`app.py` / Hugging Face Space)
 
-This repository includes a Gradio Space app in [`app.py`](app.py). It has three tabs:
+This repository includes a single-GPU Gradio app in [`app.py`](app.py), which
+also runs as a Hugging Face Space (for the eight-GPU resident service with the
+camera editor, see [Camera Studio](#-camera-studio)). The app has three tabs:
 
 - **Image → camera-controlled video**: uses the images, prompts, and matching camera poses in `examples/scenes/`; uploaded images can use the default path or the forward, backward, turn-left, and turn-right trajectories.
 - The I2V Space displays the generated RGB video and the decoded depth visualization video side by side; the final depth frame is also available as a PNG.

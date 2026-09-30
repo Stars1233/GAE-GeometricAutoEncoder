@@ -6,14 +6,8 @@
 #
 # GRADIO_SHARE=1 (default) prints a temporary public https link.
 # Set GRADIO_SHARE=0 to only listen on 0.0.0.0:$PORT.
-#
-# koala Demo (full setup + launch; --host/--port are forwarded to the server):
-#   koala submit -m demo --port 7860 --s3-log <request 8 GPUs> \
-#     -c 'GRADIO_SHARE=0 bash /abs/path/to/scripts/demo/run_serve_ulysses_i2v.sh --host 0.0.0.0 --port 7860'
-#   koala access JOB --ensure   # get/reuse the Web entry once Running
-#   koala access JOB            # print the URL to share
-# Notes: use an absolute path; koala --port must match the command --port; the
-# command stays foreground (no auto-restart); default lease 24h (--lease 5d max).
+# --host/--port and other arguments are forwarded to the server; the command
+# stays in the foreground.
 set -euo pipefail
 
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -95,6 +89,6 @@ fi
 
 log "gpus=$NGPU port=$PORT share=$GRADIO_SHARE ckpts=$GAE_CKPT_DIR outputs=$GAE_SERVE_OUTPUT"
 log "a public link is printed below when share=1; leave this process running"
-# Forward any CLI flags (e.g. --host/--port from a koala Demo front command) to
+# Forward any CLI flags (e.g. --host/--port) to
 # the server; with no flags it falls back to the PORT/HOST/GRADIO_SHARE env vars.
 exec "$PY" scripts/demo/serve_ulysses_i2v.py "$@"

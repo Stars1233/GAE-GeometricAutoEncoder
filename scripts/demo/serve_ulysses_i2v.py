@@ -830,12 +830,12 @@ def main(host: str | None = None, port: int | None = None,
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="GAE Ulysses I2V web demo")
     parser.add_argument("--host", default=os.environ.get("HOST", "0.0.0.0"),
-                        help="Bind address (koala Demo requires 0.0.0.0).")
+                        help="Bind address; 0.0.0.0 accepts remote connections.")
     parser.add_argument("--port", type=int,
                         default=int(os.environ.get("PORT", "7860")),
-                        help="Foreground port (1024-65535, not 22222).")
+                        help="Port to listen on.")
     parser.add_argument("--share", dest="share", action="store_true", default=None,
-                        help="Also open a Gradio public link (off for koala).")
+                        help="Also open a Gradio public link.")
     parser.add_argument("--no-share", dest="share", action="store_false",
                         help="Never open a Gradio public link.")
     _args = parser.parse_args()
