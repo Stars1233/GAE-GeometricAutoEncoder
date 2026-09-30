@@ -25,6 +25,8 @@ def DDTModulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> to
     """
     B, Lx, D = x.shape
     _, L, _ = shift.shape
+    if L == 1 and not torch.is_grad_enabled():
+        return x * (1 + scale) + shift
     if Lx % L != 0:
         raise ValueError(f"L_x ({Lx}) must be divisible by L ({L})")
     repeat = Lx // L
@@ -49,6 +51,8 @@ def DDTGate(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
     """
     B, Lx, D = x.shape
     _, L, _ = gate.shape
+    if L == 1 and not torch.is_grad_enabled():
+        return x * gate
     if Lx % L != 0:
         raise ValueError(f"L_x ({Lx}) must be divisible by L ({L})")
     repeat = Lx // L

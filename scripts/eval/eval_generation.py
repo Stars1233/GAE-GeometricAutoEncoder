@@ -680,6 +680,19 @@ def compute_ref_tgt_pc_gap(
     return _bidirectional_chamfer(ref, tgt, device)
 
 
+def _save_progressive_geometry(dpt_out, depth, rgb, path, H, W, stride, poses=None):
+    from scripts.demo.progressive_preview import save_geometry
+
+    ray = _ray_to_numpy(dpt_out["ray"])
+    if poses is None:
+        poses = recover_poses(ray, _rayconf_to_numpy(dpt_out.get("ray_conf")),
+                              input_size=(H, W), return_per_view_intrinsics=True)
+    save_geometry(path, ray, depth.detach().float().cpu().numpy(),
+                  rgb.detach().float().cpu().numpy(), *poses,
+                  np.array([H, W]), stride=max(1, stride))
+    print(f"    [preview] {path}", flush=True)
+
+
 def _recover_view_pointclouds(
     dpt_out, depth_tensor, rgb_imgs, H, W, device, *,
     stride: int = 4,
@@ -1178,7 +1191,8 @@ def _save_mp4(frames_rgb: list, path: str, fps: int = 4):
             os.remove(path)
         except FileNotFoundError:
             pass
-        subprocess.call(["cp", tmp_path, path])
+        subprocess.run(["cp", tmp_path, path], check=True)
+        print("GAE_ARTIFACT_READY " + json.dumps({"path": os.path.abspath(path)}), flush=True)
     except Exception as e:
         print(f"[WARN] _save_mp4 failed: {e}")
     finally:
@@ -1377,6 +1391,10 @@ def parse_args():
     p.add_argument("--pc-stride", type=int, default=1,
                    help="Point cloud pixel stride (1 = full per-pixel, no "
                         "downsampling; 4 = every 4th pixel). Default: 1.")
+    p.add_argument("--preview-rgb-device", default=None,
+                   help="Optional second CUDA device for RGB decode alongside geometry (demo only).")
+    p.add_argument("--preview-geometry", action="store_true",
+                   help="Export compact generated geometry for a fast progressive preview.")
     p.add_argument("--dump-geometry", action="store_true",
                    help="Dump per-scene <idx>_geom.npz with NGD direct geometry "
                         "(generated + VAE-encode/decode depth & ray), model "
@@ -2363,6 +2381,10 @@ def sample_v4_euler(
         t_eps_pred: clamp on t when converting x→v (mirrors trainer's
                     ``t_eps_loss=0.05`` for stable bf16 division near t=0).
     """
+    from stage2.models import ulysses as _u
+    distributed = _u.enabled() or _u.cfg_parallel_enabled()
+    if _u.cfg_parallel_enabled() and guidance_mode not in ("cfg", "none"):
+        raise ValueError("CFG parallel currently supports cfg/none guidance only")
     if z_ref_clean is not None:
         device = z_ref_clean.device
         C, h, w = z_ref_clean.shape[1:]
@@ -2380,6 +2402,12 @@ def sample_v4_euler(
     if state_v3 and cond_num > 0 and z_ref_clean is None:
         raise ValueError("state_v3 sampling requires clean refs when cond_num > 0")
     z = _make_view_correlated_noise(total_view, C, h, w, device, dtype, corr=noise_corr)
+    if distributed:
+        z = _u.broadcast_world(z)
+        z_ref_clean = _u.broadcast_world(z_ref_clean)
+        plucker_6d = _u.broadcast_world(plucker_6d)
+        ref_global = _u.broadcast_world(ref_global)
+        cfg_uncond_ref_global = _u.broadcast_world(cfg_uncond_ref_global)
     if state_v3 and cond_num > 0:
         z[:cond_num] = z_ref_clean
 
@@ -2429,9 +2457,10 @@ def sample_v4_euler(
     uncond_cnum = 0 if cfg_drop_ref else cond_num
     uncond_text = cfg_uncond_ref_global if cfg_drop_text else ref_global
 
+    timestep_values = t_grid.cpu().tolist()
     for step in range(num_steps):
-        t_cur = float(t_grid[step].item())
-        t_next = float(t_grid[step + 1].item())
+        t_cur = timestep_values[step]
+        t_next = timestep_values[step + 1]
         dt = t_next - t_cur
 
         t_tensor = torch.full((total_view,), t_cur, device=device)
@@ -2479,25 +2508,25 @@ def sample_v4_euler(
             else:
                 model_out = p_cond
         elif use_cfg and cfg_scale > 1.0 and in_interval:
-            # Explicit forwards are required here: ``forward_with_cfg`` uses
-            # ``ref_global=None`` for uncond, which skips cross-attention instead
-            # of reproducing the trained empty-caption branch.
-            p_cond = dit(
-                z, t_tensor, total_view,
-                z_ref_clean=model_z_ref_clean,
-                plucker_6d=plucker_6d,
-                cond_num=cond_num,
-                ref_global=ref_global,
-                **cond_kw,
-            )
-            p_uncond = dit(
-                z, t_tensor, total_view,
-                z_ref_clean=(None if cfg_drop_ref else model_z_ref_clean),
-                plucker_6d=uncond_plucker,
-                cond_num=uncond_cnum,
-                ref_global=uncond_text,
-                **uncond_kw,
-            )
+            if _u.cfg_parallel_enabled():
+                if _u.branch() == "cond":
+                    branch_pred = dit(z, t_tensor, total_view,
+                        z_ref_clean=model_z_ref_clean, plucker_6d=plucker_6d,
+                        cond_num=cond_num, ref_global=ref_global, **cond_kw)
+                else:
+                    branch_pred = dit(z, t_tensor, total_view,
+                        z_ref_clean=(None if cfg_drop_ref else model_z_ref_clean),
+                        plucker_6d=uncond_plucker, cond_num=uncond_cnum,
+                        ref_global=uncond_text, **uncond_kw)
+                p_cond, p_uncond = _u.exchange_cfg(branch_pred)
+            else:
+                p_cond = dit(z, t_tensor, total_view,
+                    z_ref_clean=model_z_ref_clean, plucker_6d=plucker_6d,
+                    cond_num=cond_num, ref_global=ref_global, **cond_kw)
+                p_uncond = dit(z, t_tensor, total_view,
+                    z_ref_clean=(None if cfg_drop_ref else model_z_ref_clean),
+                    plucker_6d=uncond_plucker, cond_num=uncond_cnum,
+                    ref_global=uncond_text, **uncond_kw)
             model_out = p_uncond + cfg_scale * (p_cond - p_uncond)
         else:
             model_out = dit(
@@ -3539,6 +3568,58 @@ def main():
         with torch.no_grad():
             return _t2v_text_encoder(**tokens).last_hidden_state  # (1, T, D)
 
+    # A separate RGB head can consume shared trunk tokens on a second GPU.
+    # Keep the original model intact for every other evaluation/training path.
+    preview_rgb_head = None
+    if args.preview_rgb_device:
+        import copy
+        if not args.preview_geometry or args.mode != "generate" or not has_rgb:
+            raise ValueError("--preview-rgb-device requires generated RGB + preview geometry")
+        rgb_device = torch.device(args.preview_rgb_device)
+        if (rgb_device.type != "cuda" or rgb_device.index is None
+                or rgb_device.index == torch.cuda.current_device()
+                or rgb_device.index >= torch.cuda.device_count()):
+            raise ValueError("Choose a separate CUDA device for preview RGB decode")
+        preview_rgb_head = copy.deepcopy(vae.rgb_head).to(rgb_device).eval()
+        print(f"[preview] RGB head on {rgb_device}; geometry on {device}", flush=True)
+
+    def decode_preview_pair(seq, h_l, w_l, features, views):
+        benchmark = os.environ.get("GAE_PREVIEW_BENCHMARK") == "1"
+        if benchmark:
+            torch.cuda.synchronize(seq.device)
+            torch.cuda.synchronize(rgb_device)
+        start_pair = time.perf_counter()
+        # Cross-device event protects tokens produced by the source stream.
+        ready = torch.cuda.Event()
+        ready.record(torch.cuda.current_stream(seq.device))
+        with torch.cuda.device(rgb_device):
+            torch.cuda.current_stream().wait_event(ready)
+            with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
+                rgb = preview_rgb_head(seq.to(rgb_device, non_blocking=True), h_l, w_l, num_views=views)
+        # RGB kernels continue on GPU 1 while geometry kernels run on GPU 0.
+        dpt = decode_dpt(raw_no_cls_to_dpt_input(features, backbone_norm, views),
+                         rae.rae_cl_decoder, H, W)
+        rgb = rgb.to(seq.device)
+        if benchmark:
+            torch.cuda.synchronize(seq.device)
+            torch.cuda.synchronize(rgb_device)
+            parallel_seconds = time.perf_counter()-start_pair
+            start_serial = time.perf_counter()
+            with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
+                serial_rgb = vae.rgb_head(seq, h_l, w_l, num_views=views)
+            serial_dpt = decode_dpt(raw_no_cls_to_dpt_input(features, backbone_norm, views),
+                                    rae.rae_cl_decoder, H, W)
+            torch.cuda.synchronize(seq.device)
+            serial_seconds = time.perf_counter()-start_serial
+            diff_rgb = float((serial_rgb.float()-rgb.float()).abs().max())
+            diff_depth = float((serial_dpt["depth"].float()-dpt["depth"].float()).abs().max())
+            print("[preview-decode-benchmark] " + json.dumps(dict(
+                parallel_seconds=parallel_seconds, serial_seconds=serial_seconds,
+                max_abs_rgb=diff_rgb, max_abs_depth=diff_depth)), flush=True)
+            if not torch.allclose(serial_rgb.float(), rgb.float(), atol=1e-3, rtol=1e-3):
+                raise RuntimeError("Parallel RGB decode failed serial equivalence check")
+        return rgb, dpt
+
     # ── 4. Evaluate ──
     if args.scene_manifest:
         import json as _json_manifest
@@ -3847,9 +3928,16 @@ def main():
                 with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                     seq, h_l, w_l = vae._decode_trunk(z_sampled)
 
+                paired_rgb = paired_dpt = None
+                if preview_rgb_head is not None:
+                    with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
+                        raw_pair = vae.dec_conv(seq.permute(0, 2, 1).reshape(-1, seq.shape[-1], h_l, w_l))
+                        pair_features = vae.denormalize_and_split(raw_pair)
+                    paired_rgb, paired_dpt = decode_preview_pair(seq, h_l, w_l, pair_features, out_v)
+                    del raw_pair, pair_features
                 if has_rgb:
                     with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-                        rgb_pred = vae.rgb_head(seq, h_l, w_l, num_views=out_v)
+                        rgb_pred = paired_rgb if paired_rgb is not None else vae.rgb_head(seq, h_l, w_l, num_views=out_v)
                     rgb_pred_01 = denorm(rgb_pred)
 
                     if save_artifacts:
@@ -3858,6 +3946,25 @@ def main():
                             os.path.join(ds_out_dir, f"{s_idx:03d}_rgb.png"))
                         _save_mp4(rows, os.path.join(ds_out_dir, f"{s_idx:03d}_pred.mp4"), fps=args.video_fps)
                         print(f"    Saved: {s_idx:03d}_pred.mp4 ({out_v} frames)")
+
+                        if args.preview_geometry:
+                            if n_chunks != 1:
+                                raise ValueError("Progressive demo preview needs a single chunk")
+                            preview_dpt = paired_dpt
+                            if preview_dpt is None:
+                                with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
+                                    raw_preview = vae.dec_conv(seq.permute(0, 2, 1).reshape(
+                                        -1, seq.shape[-1], h_l, w_l))
+                                    preview_feats = vae.denormalize_and_split(raw_preview)
+                                preview_dpt = decode_dpt(
+                                    raw_no_cls_to_dpt_input(preview_feats, backbone_norm, out_v),
+                                    rae.rae_cl_decoder, H, W)
+                                del preview_feats, raw_preview
+                            _save_progressive_geometry(
+                                preview_dpt, preview_dpt["depth"], rgb_pred_01,
+                                os.path.join(ds_out_dir, f"{s_idx:03d}_preview.npz"),
+                                H, W, args.pc_stride)
+                            del preview_dpt
 
                         if _free:
                             # No GT exists for a synthetic trajectory, but the
@@ -4335,13 +4442,16 @@ def main():
                         z_sampled_norm[scene_cond:], z_gt_all_norm[scene_cond:]).item()
                     print(f"    Latent L1: ref={ref_latent_l1:.4f}  tgt={tgt_latent_l1:.4f}")
 
+            paired_rgb = paired_dpt = None
+            if preview_rgb_head is not None:
+                paired_rgb, paired_dpt = decode_preview_pair(seq, h_l, w_l, recon_feats, actual_v)
             if has_rgb:
                 with _primary_output_timing():
                     with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                         if latent_backend in ("sd_vae", "wan2_1", "da3_direct"):
                             rgb_pred_01 = decode_rgb_codec(vae, latent_backend, z_sampled)
                         else:
-                            rgb_pred = vae.rgb_head(seq, h_l, w_l, num_views=actual_v)
+                            rgb_pred = paired_rgb if paired_rgb is not None else vae.rgb_head(seq, h_l, w_l, num_views=actual_v)
                             rgb_pred_01 = denorm(rgb_pred)
                 if args.mode == "recon":
                     rgb_m = compute_metrics(imgs_01.float(), rgb_pred_01.float())
@@ -4572,11 +4682,11 @@ def main():
                     recon_feats, backbone_norm, actual_v)
 
                 gen_dpt_out = None
-                need_full_dpt = bool(args.save_pointcloud or args.ref_tgt_pc_gap)
+                need_full_dpt = bool(args.save_pointcloud or args.ref_tgt_pc_gap or args.preview_geometry)
                 if need_full_dpt:
                     # Use decode_dpt to get depth + ray + ray_conf (all consistent)
                     with _primary_output_timing():
-                        gen_dpt_out = decode_dpt(gen_dpt_in, rae.rae_cl_decoder, H, W)
+                        gen_dpt_out = paired_dpt if paired_dpt is not None else decode_dpt(gen_dpt_in, rae.rae_cl_decoder, H, W)
                     gen_depth = gen_dpt_out['depth']
                 else:
                     with _primary_output_timing():
@@ -4670,6 +4780,11 @@ def main():
                         _intr_pt = torch.from_numpy(
                             np.stack([np.asarray(k, dtype=np.float32)
                                       for k in intri_list]))
+                        if args.preview_geometry and has_rgb:
+                            _save_progressive_geometry(
+                                gen_dpt_out, gen_depth, rgb_pred_01,
+                                os.path.join(ds_out_dir, f"{s_idx:03d}_preview.npz"),
+                                H, W, args.pc_stride, poses=(_pred_c2w, _pred_K))
                         _pose_arrays = dict(
                             input_c2w=np.stack(
                                 [np.asarray(p, dtype=np.float64)

@@ -45,6 +45,7 @@ import torch.nn as nn
 from einops import rearrange
 from torch.utils.checkpoint import checkpoint as grad_ckpt
 
+from . import ulysses
 from .DDT import DDTFinalLayer
 from .token_concat_ddt import TokenConcatDDT
 from .temporal_rope import build_temporal_frame_idx
@@ -184,6 +185,12 @@ class GAEFlow(TokenConcatDDT):
         return_self_flow_feature_only: bool = False,
         **kwargs,
     ):
+        if ulysses.enabled() and (self.training or t.ndim > 1 or s is not None
+                                  or self.uses_baseline_camera()
+                                  or self_flow_capture_depth is not None
+                                  or self.repa_enable
+                                  or self.s_patch_size != self.x_patch_size):
+            raise ValueError("Ulysses supports inference with scalar timesteps, matching patches and Plucker cameras")
         BV = x.shape[0]
         assert BV % total_view == 0
         B = BV // total_view
@@ -309,6 +316,8 @@ class GAEFlow(TokenConcatDDT):
                     view_frame_idx=view_frame_idx,
                 )
 
+            s_all, enc_rope, enc_plucker = ulysses.shard_spatial(
+                s_all, enc_rope, enc_plucker, total_enc_views)
             cam_kwargs = self._camera_attention_kwargs(
                 plucker_6d=enc_plucker, viewmats=viewmats, Ks=Ks, Hs=Hs, Ws=Ws,
             )
@@ -363,6 +372,7 @@ class GAEFlow(TokenConcatDDT):
                 if (
                     self.base_final_layer is not None
                     and i == self.base_model_depth
+                    and (self.training or return_dict or not getattr(self, "fast_inference", False))
                 ):
                     if z_ref_clean is not None:
                         v_tokens_b = rearrange(
@@ -383,6 +393,8 @@ class GAEFlow(TokenConcatDDT):
                         v_tokens_b = s_all
                         c_views = c_all
                     base_tokens = self.base_final_layer(v_tokens_b, c_views)
+                    if ulysses.enabled():
+                        base_tokens = ulysses.gather_sequence(base_tokens)
                     self._base_pred = self._unpatchify_enc(base_tokens, Hs, Ws)
 
             t_broadcast = (
@@ -414,6 +426,9 @@ class GAEFlow(TokenConcatDDT):
             dec_rope = self._get_rope(
                 self._dec_rope_cache, self.dec_half_head_dim,
                 Hx, Wx, x_toks.device, x_toks.dtype)
+
+        x_toks, dec_rope, dec_plucker = ulysses.shard_spatial(
+            x_toks, dec_rope, plucker_6d, total_view)
 
         # Decoder runs on V view tokens only (cond tokens dropped after encoder).
         # baseline_prope cond-extends viewmats/Ks to K+V for the encoder, so the
@@ -447,7 +462,7 @@ class GAEFlow(TokenConcatDDT):
                 pag_mode=cur_pag,
                 temporal_frame_idx=dec_frame_idx,
                 **self._camera_attention_kwargs(
-                    plucker_6d=plucker_6d, viewmats=dec_viewmats, Ks=dec_Ks, Hs=Hx, Ws=Wx,
+                    plucker_6d=dec_plucker, viewmats=dec_viewmats, Ks=dec_Ks, Hs=Hx, Ws=Wx,
                 ),
             )
             if self.training and i in self._gc_set:
@@ -459,6 +474,8 @@ class GAEFlow(TokenConcatDDT):
                 x_toks = self.blocks[i](x_toks, s, **block_kwargs)
 
         x_toks = self.final_layer(x_toks, s)
+        if ulysses.enabled():
+            x_toks = ulysses.gather_sequence(x_toks)
         out = self.unpatchify(x_toks, Hx, Wx)
 
         # DDP find_unused_parameters compat: route REPA + base preds through

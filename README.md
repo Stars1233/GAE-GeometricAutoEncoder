@@ -184,6 +184,19 @@ Use `--no-progressive-ply` on `run_demo.sh` to skip this post-processing step.
 For dataset-scale generation metrics (FVD / FID / 3D-consistency / MEt3R) see
 [Training & evaluation](#-training--evaluation) below.
 
+### 🎥 Camera Studio
+
+[Camera Studio](camera_studio.py) adds interactive camera-path authoring: move and
+rotate cameras with the mouse or WASD, capture keyframes, choose a final view,
+and preview a smooth trajectory before generation. RGB and progressive 3D play
+in one synchronized video. The source preview estimates depth from one image;
+unseen regions are empty and the generated scene may differ from the preview.
+
+Camera Studio uses the [resident multi-GPU launcher](scripts/demo/run_fast_demo.sh)
+and [one-time provisioning script](scripts/demo/provision_fast_demo.sh), with
+eight CUDA GPUs by default. Its models stay loaded between requests. The existing
+`app.py` Space and preset-trajectory demo remain available.
+
 ### ⚡ Multi-GPU Ulysses I2V server
 
 For an 81-view I2V service using Ulysses sequence parallelism, run the launcher

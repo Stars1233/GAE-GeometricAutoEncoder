@@ -19,6 +19,7 @@ Shape contract:
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import torch
@@ -28,6 +29,7 @@ import torch.utils.checkpoint as ckpt
 from einops import rearrange
 
 from .model_utils import RMSNorm
+from . import ulysses
 from .camera import PluckerFlipPE_V13
 
 try:
@@ -88,6 +90,7 @@ class PluckerAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
         self.fused_attn = fused_attn
+        self.attention_backend = os.environ.get("GAE_ATTENTION_BACKEND", "auto")
         self.plucker_pe_checkpoint = plucker_pe_checkpoint
         self.use_baseline_prope = use_baseline_prope
 
@@ -269,6 +272,16 @@ class PluckerAttention(nn.Module):
             k_ref = k[:, :, :ref_token_end] * scale.view(1, -1, 1, 1)
             k = torch.cat([k_ref, k[:, :, ref_token_end:]], dim=2)
 
+        # Keep RoPE and reference scaling in local per-view order. All-to-all
+        # permutes the full sequence rank-major, identically for Q/K/V.
+        sharded = ulysses.enabled()
+        if sharded:
+            if self.training or KP or self.use_baseline_prope or not self.fused_attn:
+                raise ValueError("Ulysses attention requires fused inference without prefix tokens/ProPE")
+            q, k = q.to(v.dtype), k.to(v.dtype)
+            packed = torch.cat([q, k, v], dim=-1).transpose(1, 2).contiguous()
+            q, k, v = ulysses.seq_to_head(packed).transpose(1, 2).chunk(3, dim=-1)
+
         # ── attention ────────────────────────────────────────────────
         if pag_mode:
             x_attn = v
@@ -301,7 +314,18 @@ class PluckerAttention(nn.Module):
 
             # Preferred fast path: FlashAttention v2.
             # Layout: PyTorch SDPA = (B, H, N, D); FA expects (B, N, H, D).
-            if FLASH_ATTN_AVAILABLE and orig_dtype in (torch.bfloat16, torch.float16):
+            if self.attention_backend == "fa3":
+                if self.training or orig_dtype != torch.bfloat16:
+                    raise ValueError("The optional FA3 backend is BF16 inference only")
+                from flash_attn_interface import flash_attn_func as flash3
+                # Pinned Hopper API supports D=48 natively; preserve its scale.
+                x_attn, _ = flash3(
+                    q.transpose(1, 2).contiguous(), k.transpose(1, 2).contiguous(),
+                    v.transpose(1, 2).contiguous(), softmax_scale=self.scale,
+                    causal=False, num_splits=1, pack_gqa=False,
+                )
+                x_attn = x_attn.transpose(1, 2)
+            elif FLASH_ATTN_AVAILABLE and orig_dtype in (torch.bfloat16, torch.float16):
                 q = q.permute(0, 2, 1, 3).contiguous()
                 k = k.permute(0, 2, 1, 3).contiguous()
                 v = v.permute(0, 2, 1, 3).contiguous()
@@ -339,6 +363,8 @@ class PluckerAttention(nn.Module):
             attn = self.attn_drop(attn)
             x_attn = attn @ v
 
+        if sharded:
+            x_attn = ulysses.head_to_seq(x_attn.transpose(1, 2).contiguous()).transpose(1, 2)
         x_attn = x_attn.transpose(1, 2).reshape(B, V * N, C)
         x_attn = rearrange(x_attn, "b (v n) c -> (b v) n c", v=V)
         x_attn = self.proj(x_attn)

@@ -233,3 +233,37 @@ def head_to_seq(x: torch.Tensor) -> torch.Tensor:
     )
     exchanged = _exchange(packed)
     return exchanged.flatten(0, 1).permute(1, 2, 0, 3).contiguous()
+
+
+class SpatialShardRoPE:
+    """RoPE for the global spatial positions owned by this inference rank."""
+    def __init__(self, rope, start, count):
+        self.cos = rope.freqs_cos[start:start + count]
+        self.sin = rope.freqs_sin[start:start + count]
+
+    def __call__(self, x):
+        from .model_utils import rotate_half
+        if x.shape[-2] != len(self.cos):
+            raise ValueError("Sharded spatial RoPE token count mismatch")
+        return x * self.cos + rotate_half(x) * self.sin
+
+
+def shard_spatial(x, rope, plucker, views):
+    """Shard spatial tokens inside each view, retaining per-view AdaLN layout."""
+    if not enabled():
+        return x, rope, plucker
+    tokens = x.shape[1]
+    if tokens % world_size():
+        raise ValueError(f"Spatial token count {tokens} is not divisible by {world_size()}")
+    count = tokens // world_size()
+    start = rank() * count
+    x = x[:, start:start + count].contiguous()
+    if rope is not None:
+        rope = SpatialShardRoPE(rope, start, count)
+    if plucker is not None:
+        b, length, d = plucker.shape
+        if length != views * tokens:
+            raise ValueError("Camera rays do not match sharded view/token layout")
+        plucker = plucker.reshape(b, views, tokens, d)[:, :, start:start + count]
+        plucker = plucker.reshape(b, views * count, d).contiguous()
+    return x, rope, plucker

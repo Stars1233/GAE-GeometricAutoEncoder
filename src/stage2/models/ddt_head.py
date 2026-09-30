@@ -164,6 +164,20 @@ class LightningDDTBlockV3(nn.Module):
             # Gate=0 ensures zero output at init (warm-start safe from old checkpoint).
             self.cross_attn_gate = nn.Parameter(torch.full((1,), 0.01))
 
+    def _text_attention(self, query, context):
+        normalized = self.cross_attn_norm(query)
+        batch = context.shape[0]
+        if not self.training and getattr(self, "fold_text_queries", False):
+            # Text attention does not couple query positions. Folding views
+            # avoids projecting identical text K/V once per view.
+            folded = normalized.reshape(batch, -1, normalized.shape[-1])
+            output, _ = self.cross_attn(folded, context, context, need_weights=False)
+            return output.reshape_as(query)
+        views = query.shape[0] // batch
+        expanded = context[:, None].expand(batch, views, *context.shape[1:])
+        expanded = expanded.reshape(batch * views, *context.shape[1:])
+        return self.cross_attn(normalized, expanded, expanded, need_weights=self.training)[0]
+
     def forward(
         self,
         x: torch.Tensor,
@@ -226,19 +240,14 @@ class LightningDDTBlockV3(nn.Module):
                 x_tgt_flat = rearrange(x_tgt, "b v n d -> (b v) n d")
 
                 tgt_v = V - cond_num
-                ctx = ref_global.unsqueeze(1).expand(B, tgt_v, *ref_global.shape[1:])
-                ctx = ctx.reshape(B * tgt_v, *ref_global.shape[1:])
-
-                attn_out, _ = self.cross_attn(self.cross_attn_norm(x_tgt_flat), ctx, ctx)
+                attn_out = self._text_attention(x_tgt_flat, ref_global)
                 x_tgt_flat = x_tgt_flat + self.cross_attn_gate * attn_out
 
                 x_tgt = rearrange(x_tgt_flat, "(b v) n d -> b v n d", v=tgt_v)
                 x = rearrange(torch.cat([x_ref, x_tgt], dim=1), "b v n d -> (b v) n d")
             else:
                 # Apply text to all views (or cond_num==0 so all are tgt).
-                ctx = ref_global.unsqueeze(1).expand(B, V, *ref_global.shape[1:])
-                ctx = ctx.reshape(BV, *ref_global.shape[1:])
-                attn_out, _ = self.cross_attn(self.cross_attn_norm(x), ctx, ctx)
+                attn_out = self._text_attention(x, ref_global)
                 x = x + self.cross_attn_gate * attn_out
 
         x = x + DDTGate(
