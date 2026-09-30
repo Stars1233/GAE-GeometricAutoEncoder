@@ -62,6 +62,10 @@ class SamplerGroup:
         from eval_generation import sample_v4_euler
 
         values = dict(kwargs, z_ref_clean=z_ref, total_view=views, cond_num=cond_num)
+        # Workers raise on the same checks and a worker exception stops the
+        # whole service, so reject unsupported options before broadcasting.
+        if ulysses.cfg_parallel_enabled() and values.get("guidance_mode", "cfg") not in ("cfg", "none", "ig"):
+            raise ValueError("CFG parallel supports cfg/ig/none guidance only")
         self.busy = True
         self._broadcast(values)
         result = sample_v4_euler(model, **values)
@@ -107,6 +111,8 @@ class SamplerGroup:
             if "configure" in values:
                 self._apply_configuration(values["configure"])
                 continue
+            if "device" in values:
+                values["device"] = self.device
             with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
                 sample_v4_euler(self.model, **values)
 
@@ -165,6 +171,22 @@ def main():
     if dist.get_rank() != 0:
         group.serve_workers()
     else:
+        if a.serve and os.environ.get("GAE_CAPTION", "1") != "0":
+            import threading
+
+            # transformers resolves submodules lazily and concurrent first
+            # imports from two threads can see a half-initialized module, so
+            # import on this thread before loading in the background.
+            from transformers import (  # noqa: F401
+                AutoProcessor,
+                Qwen2_5_VLForConditionalGeneration,
+                TextIteratorStreamer,
+            )
+
+            from scripts.demo import captioner
+
+            # Loading the caption model takes about a minute; overlap it with warm-up.
+            threading.Thread(target=captioner.warm, daemon=True).start()
         a.output.mkdir(parents=True, exist_ok=False)
         report = {
             "status": "running",
@@ -196,7 +218,7 @@ def main():
                 app.demo.queue(default_concurrency_limit=1).launch(
                     server_name=a.host,
                     server_port=a.port,
-                    share=False, css=app.CSS,
+                    share=os.environ.get("GRADIO_SHARE", "0") == "1", css=app.CSS,
                     allowed_paths=[str(app.OUTPUT_ROOT), str(ROOT / "examples"),
                                    str(ROOT / "scripts/demo/camera_editor.js"),
                                    str(ROOT / "scripts/demo/camera_studio.css")],

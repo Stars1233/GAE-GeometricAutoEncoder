@@ -28,6 +28,7 @@ import gradio as gr
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+from scripts.demo import captioner
 from scripts.demo.trajectory_utils import (
     load_reference_poses,
     render_trajectory_preview,
@@ -103,7 +104,10 @@ PLAYBACK_TIMING_JS = r"""(...args) => {
 }"""
 
 HF_REPO = os.environ.get("GAE_HF_REPO", "TencentARC/GAE-D64-1B")
-CKPT_DIR = Path(os.environ.get("GAE_SPACE_CKPT_DIR", "/tmp/gae-space-ckpts"))
+# Same directory the resident engine loads from, so side jobs never re-download.
+CKPT_DIR = Path(
+    os.environ.get("GAE_SPACE_CKPT_DIR") or os.environ.get("GAE_CKPT_DIR") or str(ROOT / "ckpts")
+)
 OUTPUT_ROOT = Path(os.environ.get("GAE_SPACE_OUTPUT_DIR", "/tmp/gae-space-results"))
 
 VIEW_CHOICES = [17, 33, 81]
@@ -249,8 +253,8 @@ def generate_direct_camera(image, prompt, _trajectory, views, steps, cfg, seed, 
 def _run(command: list[str], output_dir: Path, timeout: int) -> tuple[str, float]:
     output_dir.mkdir(parents=True, exist_ok=True)
     started = time.time()
-    env = os.environ.copy()
-    env.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+    # Runs beside the resident engine: one GPU, the one with the most free memory.
+    env = captioner.side_job_env(os.environ)
     env.setdefault("TOKENIZERS_PARALLELISM", "false")
     env["PYTHONPATH"] = f"{ROOT / 'src'}:{ROOT / 'scripts' / 'eval'}:{env.get('PYTHONPATH', '')}"
     try:
@@ -389,7 +393,8 @@ def generate_i2v(
         elapsed = result["timings"]["request_seconds"]
         status = (f"GAE-64 · {views} views · {steps} Euler steps · seed {seed} · "
                   f"Synchronized result in {elapsed:.1f}s (server)")
-        yield result["rgb_video"], None, None, None, None, status, result["synchronized_video"], result["geometry"]
+        yield (result["rgb_video"], result.get("depth_video"), None, None, None, status,
+               result["synchronized_video"], result["geometry"])
         return
     elapsed, error = 0., None
     for event in _run_i2v_stream(command, run_dir, timeout=max(1800, _duration_i2v(views, steps) * 2)):
@@ -454,11 +459,22 @@ def download_pointcloud(source):
 
 
 @spaces.GPU(duration=_duration_t2i)
-def generate_t2i(prompt: str, steps: int, cfg_scale: float, seed: int, pc_stride: int):
+def generate_t2i(prompt: str, steps: int, guidance: str, scale: float, seed: int, pc_stride: int):
     prompt = (prompt or "").strip()
     if not prompt:
         raise gr.Error("Enter a prompt first.")
+    guidance = "cfg" if str(guidance).lower().startswith("cfg") else "ig"
     run_dir = OUTPUT_ROOT / f"t2i-{uuid.uuid4().hex}"
+    label = f"{guidance.upper()} {float(scale):g}"
+    if RESIDENT_ENGINE is not None:
+        started = time.perf_counter()
+        written = RESIDENT_ENGINE.text_to_image(
+            prompt, steps=int(steps), guidance=guidance, scale=float(scale), seed=int(seed),
+            pc_stride=int(pc_stride), output_dir=run_dir)
+        status = (f"GAE-64 T2I · {steps} Euler steps · {label} · seed {int(seed)} · "
+                  f"{time.perf_counter() - started:.1f}s on the resident GPUs")
+        return (str(written["image"]), str(written["depth"]), str(written["pointcloud"]),
+                str(written["preview"]), status)
     command = [
         sys.executable,
         str(ROOT / "scripts" / "demo" / "generate_t2i.py"),
@@ -467,7 +483,8 @@ def generate_t2i(prompt: str, steps: int, cfg_scale: float, seed: int, pc_stride
         "--prompts", prompt,
         "--num-images", "1",
         "--sample-steps", str(int(steps)),
-        "--cfg-scale", str(float(cfg_scale)),
+        "--guidance", guidance,
+        "--cfg-scale" if guidance == "cfg" else "--ig-scale", str(float(scale)),
         "--seed", str(int(seed)),
         "--pc-stride", str(int(pc_stride)),
         "--output", str(run_dir),
@@ -479,8 +496,38 @@ def generate_t2i(prompt: str, steps: int, cfg_scale: float, seed: int, pc_stride
     pointcloud = _latest(run_dir, ("_pointcloud.ply",))
     if image is None:
         raise gr.Error("Generation completed but no PNG was produced.")
-    status = f"GAE-64 T2I · {steps} Euler steps · seed {int(seed)} · {elapsed:.1f}s"
-    return str(image), str(depth) if depth else None, str(pointcloud) if pointcloud else None, status
+    status = f"GAE-64 T2I · {steps} Euler steps · {label} · seed {int(seed)} · {elapsed:.1f}s"
+    return (str(image), str(depth) if depth else None, str(pointcloud) if pointcloud else None,
+            _cloud_view(pointcloud), status)
+
+
+def _cloud_view(ply: Path | None) -> str | None:
+    if ply is None:
+        return None
+    try:
+        from scripts.demo.pointcloud_view import ply_preview
+        preview = ply_preview(ply)
+    except Exception as exc:  # noqa: BLE001 - the .ply download still works
+        print(f"[pointcloud] preview failed for {ply}: {type(exc).__name__}: {exc}", flush=True)
+        return None
+    return str(preview) if preview else None
+
+
+def _reconstruct_resident(video: Path, out_dir: Path) -> dict[str, Path] | None:
+    """Reuse the resident codec; None when the service has none or runs out of memory."""
+    engine = RESIDENT_ENGINE
+    if engine is None:
+        return None
+    import torch
+    from scripts.demo.reconstruct_vae import reconstruct
+    with engine.lock:
+        try:
+            return reconstruct(engine.model, video, out_dir, pc_stride=4)
+        except torch.cuda.OutOfMemoryError:
+            print("[vae] resident GPU out of memory; using a separate process", flush=True)
+            return None
+        finally:
+            torch.cuda.empty_cache()
 
 
 @spaces.GPU(duration=900)
@@ -489,31 +536,52 @@ def reconstruct_vae(image: str | None):
     if not image:
         raise gr.Error("Upload an image first.")
     run_dir = OUTPUT_ROOT / f"vae-recon-{uuid.uuid4().hex}"
-    command = [
-        sys.executable,
-        str(ROOT / "scripts" / "demo" / "reconstruct_vae.py"),
-        "--video", str(image),
-        "--hf-repo", HF_REPO,
-        "--cache-dir", str(CKPT_DIR),
-        "--pc-stride", "4",
-        "--output", str(run_dir),
-    ]
-    _, elapsed = _run(command, run_dir, timeout=1800)
     stem_dir = run_dir / Path(image).stem
-    rgb = stem_dir / "rgb_recon.mp4"
-    depth = stem_dir / "depth_recon.mp4"
-    pointcloud = stem_dir / "recon_pointcloud.ply"
-    if not rgb.is_file():
+    started = time.perf_counter()
+    written = _reconstruct_resident(Path(image), stem_dir)
+    elapsed = time.perf_counter() - started
+    log_note = ""
+    if written is None:
+        command = [
+            sys.executable,
+            str(ROOT / "scripts" / "demo" / "reconstruct_vae.py"),
+            "--video", str(image),
+            "--hf-repo", HF_REPO,
+            "--cache-dir", str(CKPT_DIR),
+            "--pc-stride", "4",
+            "--output", str(run_dir),
+        ]
+        _, elapsed = _run(command, run_dir, timeout=1800)
+        written = {kind: stem_dir / name for kind, name in (
+            ("rgb", "rgb_recon.mp4"), ("depth", "depth_recon.mp4"),
+            ("pointcloud", "recon_pointcloud.ply"), ("preview", "recon_pointcloud_preview.glb"))}
+        log_note = f"\n\n[Download the full run log](file={run_dir / 'space_run.log'})"
+    rgb, depth = written.get("rgb"), written.get("depth")
+    pointcloud, preview = written.get("pointcloud"), written.get("preview")
+    if rgb is None or not rgb.is_file():
         raise gr.Error("VAE reconstruction completed but no RGB output was produced.")
-    if not pointcloud.is_file():
+    if pointcloud is None or not pointcloud.is_file():
         raise gr.Error("VAE reconstruction completed but no point cloud was produced.")
     return (
         str(rgb),
-        str(depth) if depth.is_file() else None,
-        str(pointcloud) if pointcloud.is_file() else None,
-        f"GAE-64 VAE reconstruction · {elapsed:.1f}s\n\n"
-        f"[Download the full run log](file={run_dir / 'space_run.log'})",
+        str(depth) if depth and depth.is_file() else None,
+        str(pointcloud),
+        str(preview) if preview and preview.is_file() else None,
+        f"GAE-64 VAE reconstruction · {elapsed:.1f}s{log_note}",
     )
+
+
+def describe_image(image: str | None):
+    """Stream a scene description for the uploaded image into the prompt box."""
+    if not image:
+        yield gr.update()
+        return
+    try:
+        yield from captioner.stream(image)
+    except Exception as exc:  # noqa: BLE001 - the prompt stays editable
+        print(f"[caption] failed: {type(exc).__name__}: {exc}", flush=True)
+        gr.Warning("Automatic description failed; type one if you want to guide the scene.")
+        yield gr.update()
 
 
 def choose_scene_example(event: gr.SelectData):
@@ -544,8 +612,9 @@ Choose an image, place your cameras, and generate a scene in motion.
                 with gr.Row(equal_height=False, elem_id="gae-io-layout"):
                     with gr.Column(scale=3, min_width=550, elem_id="gae-input-panel"):
                         i2v_image = gr.Image(label="Input image", type="filepath", sources=["upload", "clipboard"], height=220)
-                        with gr.Accordion("Scene description · optional", open=False):
-                            i2v_prompt = gr.Textbox(label="Scene description", lines=2, placeholder="Optional details to guide the scene…")
+                        with gr.Accordion("Scene description · filled in automatically", open=True):
+                            i2v_prompt = gr.Textbox(label="Scene description", lines=3,
+                                                    placeholder="Written automatically after upload; edit freely…")
                         gr.Markdown("**Build your camera path** · Move, add keyframes, then choose Final.")
                         i2v_camera_editor = gr.HTML(
                             value=None,
@@ -583,15 +652,16 @@ Choose an image, place your cameras, and generate a scene in motion.
                         with gr.Accordion("Downloads & details", open=False):
                             i2v_video = gr.File(label="RGB video download")
                             i2v_depth_video = gr.Video(label="Decoded depth video", autoplay=False, loop=False, height=240)
-                            with gr.Row():
-                                i2v_path = gr.State()
-                                i2v_depth = gr.Image(label="Last decoded depth", height=220)
+                            i2v_path = gr.State()
+                            i2v_depth = gr.State()
                             with gr.Row():
                                 i2v_cloud = gr.File(label="Sampled scene point cloud (.ply)")
                                 i2v_download = gr.Button("Prepare point-cloud download")
                         i2v_download.click(download_pointcloud, inputs=[i2v_geometry], outputs=[i2v_cloud])
                 i2v_image.change(prepare_direct_camera, inputs=[i2v_image],
                                  outputs=[i2v_camera_editor, i2v_camera_scene], trigger_mode="always_last")
+                i2v_image.change(describe_image, inputs=[i2v_image], outputs=[i2v_prompt],
+                                 trigger_mode="always_last", concurrency_id="caption")
                 i2v_views.change(None, inputs=[i2v_views], outputs=[],
                                  js="(v) => { window.gaeCameraEditor?.setViews(v); return []; }")
                 generation = i2v_run.click(
@@ -630,6 +700,8 @@ Choose an image, place your cameras, and generate a scene in motion.
                     with gr.Column(scale=1):
                         vae_rgb = gr.Video(label="Reconstructed RGB video", autoplay=True, loop=True, height=300)
                         vae_depth = gr.Video(label="Reconstructed depth video", autoplay=True, loop=True, height=300)
+                        vae_view = gr.Model3D(label="Reconstructed point cloud",
+                                              clear_color=[1.0, 1.0, 1.0, 1.0], height=360)
                         vae_cloud = gr.File(label="Reconstructed point cloud (.ply)")
                 vae_status = gr.Markdown()
                 if VAE_VIDEO_EXAMPLES:
@@ -642,36 +714,41 @@ Choose an image, place your cameras, and generate a scene in motion.
                 vae_run.click(
                     reconstruct_vae,
                     inputs=[vae_image],
-                    outputs=[vae_rgb, vae_depth, vae_cloud, vae_status],
+                    outputs=[vae_rgb, vae_depth, vae_cloud, vae_view, vae_status],
                 )
             with gr.Tab("Text to image"):
-                with gr.Row():
-                    with gr.Column(scale=1):
+                with gr.Row(equal_height=False):
+                    with gr.Column(scale=2, min_width=320):
                         t2i_prompt = gr.Textbox(label="Prompt", lines=4, placeholder="Describe an image…")
                         t2i_run = gr.Button("Generate image", variant="primary")
-                    with gr.Column(scale=1):
+                        with gr.Accordion("Advanced settings", open=True):
+                            t2i_guidance = gr.Radio(
+                                label="Guidance", choices=["IG (internal guidance)", "CFG"],
+                                value="IG (internal guidance)",
+                                info="IG amplifies the gap to a shallow-layer prediction; CFG to the empty prompt.")
+                            t2i_scale = gr.Slider(label="Guidance scale", minimum=0.0, maximum=6.0, step=0.1, value=2.0,
+                                                  info="IG: 0 = no guidance. CFG: 1 = no guidance.")
+                            t2i_steps = gr.Slider(label="Sampling steps", minimum=10, maximum=50, step=5, value=25)
+                            t2i_seed = gr.Number(label="Seed", value=0, precision=0)
+                            t2i_stride = gr.Slider(label="Point-cloud stride", minimum=2, maximum=8, step=1, value=4)
+                        if T2I_EXAMPLES:
+                            gr.Examples(
+                                examples=T2I_EXAMPLES,
+                                inputs=[t2i_prompt],
+                                label="Repository T2I examples — examples/t2i_prompts.txt",
+                                examples_per_page=8,
+                            )
+                    with gr.Column(scale=3, min_width=420):
                         t2i_image = gr.Image(label="Generated image", height=320)
-                        t2i_depth = gr.Image(label="Decoded depth", height=220)
-                with gr.Row():
-                    t2i_cloud = gr.File(label="Point cloud (.ply)")
-                    t2i_status = gr.Markdown()
-                with gr.Accordion("Advanced settings", open=False):
-                    with gr.Row():
-                        t2i_steps = gr.Slider(label="Sampling steps", minimum=10, maximum=50, step=5, value=25)
-                        t2i_cfg = gr.Slider(label="CFG scale", minimum=1.0, maximum=4.0, step=0.1, value=2.0)
-                        t2i_seed = gr.Number(label="Seed", value=0, precision=0)
-                        t2i_stride = gr.Slider(label="Point-cloud stride", minimum=2, maximum=8, step=1, value=4)
-                if T2I_EXAMPLES:
-                    gr.Examples(
-                        examples=T2I_EXAMPLES,
-                        inputs=[t2i_prompt],
-                        label="Repository T2I examples — examples/t2i_prompts.txt",
-                        examples_per_page=8,
-                    )
+                        t2i_status = gr.Markdown()
+                        with gr.Row():
+                            t2i_depth = gr.Image(label="Decoded depth", height=260)
+                            t2i_view = gr.Model3D(label="Point cloud", clear_color=[1.0, 1.0, 1.0, 1.0], height=260)
+                        t2i_cloud = gr.File(label="Point cloud (.ply)")
                 t2i_run.click(
                     generate_t2i,
-                    inputs=[t2i_prompt, t2i_steps, t2i_cfg, t2i_seed, t2i_stride],
-                    outputs=[t2i_image, t2i_depth, t2i_cloud, t2i_status],
+                    inputs=[t2i_prompt, t2i_steps, t2i_guidance, t2i_scale, t2i_seed, t2i_stride],
+                    outputs=[t2i_image, t2i_depth, t2i_cloud, t2i_view, t2i_status],
                 )
         gr.Markdown(
             """

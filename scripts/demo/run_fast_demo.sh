@@ -8,6 +8,7 @@ GAE_PYTHON="${GAE_VENV:-$GAE_ROOT/.venv}/bin/python"
 [[ -x "$GAE_PYTHON" ]] || { echo 'Set GAE_VENV to the provisioned GAE environment.' >&2; exit 1; }
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
 export GAE_SPACE_OUTPUT_DIR="${GAE_SPACE_OUTPUT_DIR:-$GAE_ROOT/results/camera-studio}"
+export GAE_CKPT_DIR="${GAE_CKPT_DIR:-$GAE_ROOT/ckpts}"
 if [[ -n "${GAE_FA3_ROOT:-}" ]]; then
   [[ -f "$GAE_FA3_ROOT/hopper/flash_attn_interface.py" ]] || { echo 'Build the optional FA3 backend first.' >&2; exit 1; }
   export GAE_ATTENTION_BACKEND=fa3
@@ -18,7 +19,7 @@ GAE_STATE="${GAE_SERVER_STATE:-$GAE_ROOT/results/service-$(date +%Y%m%d-%H%M%S)-
 exec "$GAE_PYTHON" -u -m torch.distributed.run --standalone --nproc_per_node="${NGPU:-8}" \
   scripts/demo/distributed_engine.py --serve --cfg-parallel \
   --host "${HOST:-127.0.0.1}" --port "${PORT:-7860}" \
-  --checkpoint-dir "${GAE_CKPT_DIR:-$GAE_ROOT/ckpts}" \
+  --checkpoint-dir "$GAE_CKPT_DIR" \
   --image examples/scenes/forest_lake_trail.jpg \
   --prompt-file examples/scenes/forest_lake_trail.txt \
   --poses examples/scenes/forest_lake_trail_poses.npz \

@@ -296,6 +296,73 @@ class Engine:
                         imageKey=image_key(image), preparedImage=str(prepared_image),
                         metricScale=metric_scale, scaleQuantiles=scale_quantiles, depthUnits="estimated meters")
 
+    def text_to_image(self, prompt, *, steps=25, guidance="ig", scale=2.0, seed=0, pc_stride=4,
+                      output_dir):
+        """One 672x378 image with depth and point cloud, sampled like ``generate_t2i.py``.
+
+        ``guidance`` is ``ig`` (internal guidance, the script default) or ``cfg``;
+        ``scale`` is the matching guidance strength.
+        """
+        if guidance not in ("ig", "cfg"):
+            raise ValueError("guidance must be 'ig' or 'cfg'")
+        from eval_data import depth_to_numpy_img
+        from PIL import Image
+
+        from scripts.demo.pointcloud_view import glb_preview, write_ply
+
+        if not prompt or not prompt.strip():
+            raise ValueError("A nonempty prompt is required")
+        t, ev = self.torch, self.ev
+        vae, rae, dit = self.model.codec, self.model.backbone, self.model.flow
+        output = Path(output_dir).resolve()
+        output.mkdir(parents=True, exist_ok=True)
+        with self.lock, t.inference_mode():
+            text = self.text_encoder([prompt.strip()])["tokens"].to(self.device)
+            t.manual_seed(int(seed))
+            with t.autocast("cuda", dtype=t.bfloat16):
+                z_std = getattr(self, "sampler", ev.sample_v4_euler)(
+                    dit,
+                    None,
+                    1,
+                    0,
+                    plucker_6d=None,
+                    ref_global=text,
+                    cfg_uncond_ref_global=self.null_tokens,
+                    num_steps=int(steps),
+                    cfg_scale=float(scale) if guidance == "cfg" else 1.0,
+                    guidance_mode=guidance,
+                    ig_scale=float(scale) if guidance == "ig" else 0.0,
+                    time_dist_shift=float(self.config.misc.time_dist_shift),
+                    eps=0.001,
+                    noise_shape=(int(self.mean.shape[1]), 378 // 14, 672 // 14),
+                    device=self.device,
+                    dtype=t.float32,
+                    prediction=str(self.config.transport.params.prediction),
+                )
+                z = ev._denorm_latent(z_std, self.mean, self.std, self.unwhiten)
+                rgb = self.model.decode_rgb(z, num_views=1).float().clamp(0, 1)
+                seq, h, w = vae._decode_trunk(z)
+                raw = vae.dec_conv(seq.permute(0, 2, 1).reshape(-1, seq.shape[-1], h, w))
+                features = vae.denormalize_and_split(raw)
+            dpt = ev.decode_dpt(
+                ev.raw_no_cls_to_dpt_input(features, rae.encoder.backbone.pretrained.norm, 1),
+                rae.rae_cl_decoder,
+                378,
+                672,
+            )
+            image = output / "t2i.png"
+            Image.fromarray(
+                (rgb[0].permute(1, 2, 0).cpu().numpy() * 255 + 0.5).astype("uint8")
+            ).save(image)
+            depth = output / "t2i_depth.png"
+            Image.fromarray(depth_to_numpy_img(dpt["depth"][0])).save(depth)
+            xyz, colors = ev._scene_pointcloud_from_dpt(
+                dpt, dpt["depth"], rgb, 1, 378, 672, self.device, stride=max(int(pc_stride), 1)
+            )
+        pointcloud = write_ply(output / "t2i_pointcloud.ply", xyz, colors)
+        preview = glb_preview(xyz, colors, output / "t2i_pointcloud_preview.glb")
+        return dict(image=image, depth=depth, pointcloud=pointcloud, preview=preview)
+
     def _sync(self):
         self.torch.cuda.synchronize(self.device)
 
@@ -475,6 +542,9 @@ class Engine:
                 ev._save_mp4([tensor_to_numpy_img(frame) for frame in rgb], str(video), fps=fps)
                 if not video.is_file() or not video.stat().st_size:
                     raise RuntimeError("RGB encoder did not produce a video")
+            depth_video = output / "000_depth.mp4"
+            with self._phase(timings, "depth_encode_seconds"):
+                ev._save_mp4(ev.depth_to_numpy_video(dpt["depth"]), str(depth_video), fps=fps)
             if save_parity:
                 with self._phase(timings, "parity_export_seconds"):
                     t.save(
@@ -509,6 +579,7 @@ class Engine:
                 )
         return {
             "rgb_video": str(video),
+            "depth_video": str(depth_video) if depth_video.is_file() else None,
             "synchronized_video": str(synchronized),
             "geometry": str(source),
             "views": views,

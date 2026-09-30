@@ -2383,8 +2383,10 @@ def sample_v4_euler(
     """
     from stage2.models import ulysses as _u
     distributed = _u.enabled() or _u.cfg_parallel_enabled()
-    if _u.cfg_parallel_enabled() and guidance_mode not in ("cfg", "none"):
-        raise ValueError("CFG parallel currently supports cfg/none guidance only")
+    # ``none``/``ig`` need only the conditional pass, which both CFG halves run
+    # independently inside their own Ulysses group.
+    if _u.cfg_parallel_enabled() and guidance_mode not in ("cfg", "none", "ig"):
+        raise ValueError("CFG parallel currently supports cfg/ig/none guidance only")
     if z_ref_clean is not None:
         device = z_ref_clean.device
         C, h, w = z_ref_clean.shape[1:]

@@ -22,10 +22,16 @@ uv pip install --python "$GAE_VENV/bin/python" -c "$GAE_CONSTRAINTS" -e '.[space
 "$GAE_VENV/bin/python" scripts/demo/download_checkpoints.py --out-dir "$GAE_CKPT_DIR"
 "$GAE_VENV/bin/python" - "$GAE_CKPT_DIR" <<'PY'
 from pathlib import Path
+import os
 import sys
 from gae.hub import extract_da3_stats
 from huggingface_hub import snapshot_download
 extract_da3_stats(Path(sys.argv[1]) / 'da3_stats_giant_5ds.tar', Path('model_stats/da3_giant_5ds'))
-for repo in ('depth-anything/DA3-GIANT-1.1', 'depth-anything/DA3METRIC-LARGE', 'Qwen/Qwen3-0.6B'):
+repos = ['depth-anything/DA3-GIANT-1.1', 'depth-anything/DA3METRIC-LARGE', 'Qwen/Qwen3-0.6B']
+# Scene descriptions for uploaded images (~16 GB); GAE_CAPTION=0 skips it.
+from scripts.demo.captioner import CAPTION_MODEL
+if os.environ.get('GAE_CAPTION', '1') != '0' and not Path(CAPTION_MODEL).is_dir():
+    repos.append(CAPTION_MODEL)
+for repo in repos:
     snapshot_download(repo)
 PY
